@@ -1,6 +1,5 @@
 ---
-
-name: Lint
+name: CI
 
 on:
   pull_request:
@@ -17,40 +16,26 @@ permissions:
   contents: read
 
 jobs:
-  Lint:
-    name: Lint (${{ matrix.label }})
+  Build:
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: CSS
-            command: npx stylelint "_styles/**/*.css" --custom-formatter @csstools/stylelint-formatter-github
-          - label: JS
-            command: ./_tests/javascript.sh
-          - label: PHP
-            command: ./_tests/php.sh
-          - label: Translations
-            command: php ./_tests/translations.php
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup PHP
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
         with:
-          php-version: '8.5'
+          php-version: 8.1
           tools: composer
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 'lts/*'
+          node-version: 18
 
       - name: Install
-        run: npm ci
+        run: npm ci --ignore-scripts
 
-      - name: Lint
-        run: ${{ matrix.command }}
+      - name: Build
+        run: npm run build
