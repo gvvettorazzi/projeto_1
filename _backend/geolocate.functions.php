@@ -1,177 +1,322 @@
 <?php
 
-////    Continents
-// NA   North america    Split by locale between NYC3 and SFO1
-// SA   South america    Split by IP hash between NYC3 and SFO1
-// EU   Europe           Split by locale between AMS3 and FRA1
-// AF   Africa           Split by IP hash between AMS3 and FRA1
-// AS   Asia             SGP1
-// OC   Oceania          SGP1
-// AN   Antarctica       SGP1
-
 require_once __DIR__ . '/bootstrap.php';
-require_once __DIR__.'/log-echo.php';
+require_once __DIR__ . '/log-echo.php';
+
 use GeoIp2\Database\Reader;
 
-////    getDownloadRegion
-// Lookup the IP, and classify it by:
-// - Continent
-// - Country
-// - Timezone
-// Returns either a string of the selected region,
-// or an array of two regions.
-function getDownloadRegion($hostname, $debug = false)
+/**
+ * Path to the GeoIP database.
+ */
+const GEOIP_DATABASE_PATH = __DIR__ . '/GeoLite2-City.mmdb';
+
+/**
+ * Returns a shared GeoIP reader instance.
+ *
+ * Reusing the reader avoids reopening the GeoIP database
+ * multiple times during the same request.
+ *
+ * @throws RuntimeException
+ */
+function getGeoIpReader()
 {
+    static $reader = null;
 
-    try {
-        if (!class_exists('GeoIp2\Database\Reader')) {
-            throw new \Exception('Class GeoIp2\Database\Reader not found');
-        }
-        $reader = new Reader(__DIR__.'/GeoLite2-City.mmdb');
-        $record = $reader->city($hostname);
-
-        $continent = $record->continent->code;
-        $country   = $record->country->isoCode;
-        $longitude = $record->location->longitude;
-    } catch (\Exception $e) {
-        if ($debug) {
-            echo $e->getMessage();
-        } else {
-            error_log($e->getMessage());
-        }
-
-        $continent = false;
-        $country   = false;
-        $longitude = false;
+    if ($reader instanceof Reader) {
+        return $reader;
     }
+
+    if (!class_exists(Reader::class)) {
+        throw new RuntimeException('Class GeoIp2\Database\Reader not found');
+    }
+
+    if (!is_readable(GEOIP_DATABASE_PATH)) {
+        throw new RuntimeException(
+            'GeoIP database not found or not readable: ' . GEOIP_DATABASE_PATH
+        );
+    }
+
+    $reader = new Reader(GEOIP_DATABASE_PATH);
+
+    return $reader;
+}
+
+/**
+ * Handles GeoIP errors consistently.
+ *
+ * @param Throwable $exception
+ * @param bool      $debug
+ */
+function handleGeoIpError($exception, $debug = false)
+{
+    $message = $exception->getMessage();
 
     if ($debug) {
-        echo 'Continent: "'.$continent.'"'."\n";
-        echo 'Country: "'  .$country  .'"'."\n";
-        echo 'Longitude: "'.$longitude.'"'."\n";
+        echo $message . PHP_EOL;
+
+        return;
     }
 
-    // North America
-    if ($continent == 'NA') {
-        // These lists are based on who is on what side of the USA.
-        $northEast = array('BZ', 'CR', 'SV', 'GT', 'HN', 'MX', 'NI', 'PA');
-        /** @var string $northWest */
-        $northWest = array('AG', 'BS', 'BB', 'BM', 'VG', 'KY', 'CU', 'DM', 'DO', 'GL', 'GD', 'GP', 'HT', 'JM', 'MQ', 'MS', 'CW', 'AW', 'SX', 'BQ', 'PR', 'BL', 'KN', 'AI', 'LC', 'MF', 'PM', 'VC', 'TT', 'TC', 'VI');
-        if (in_array($country, $northEast) ||
-            $longitude < -100
-        ) {
-            return 'sfo1';
-        } elseif (in_array($country, $northWest) ||
-            $longitude >= -100
-        ) {
-            return 'nyc3';
-        } else {
-            return array('nyc3', 'sfo1');
-        }
+    error_log($message);
+}
 
-    // Europe
-    } elseif ($continent == 'EU') {
-        // These lists are based on who is connected to which international exchange directly.
-        // They are by no means exclusive.
-        $isles = array('GB', 'IM', 'IE', 'FO', 'IS', 'GG', 'JE', 'GI');
-        $vikings = array('NL', 'SX', 'DK', 'NO', 'SE', 'FI', 'SJ');
-        // Great Britain
-        if (in_array($country, $isles)) {
-            return 'ams3';
-        // Vikings
-        } elseif (in_array($country, $vikings)) {
-            return 'ams3';
-        // Everywhere else
-        } else {
-            return array('ams3', 'fra1');
-        }
+/**
+ * Looks up an IP address using the GeoIP database.
+ *
+ * Returns null when the lookup cannot be completed.
+ *
+ * @param string $hostname
+ * @param bool   $debug
+ *
+ * @return mixed|null
+ */
+function getGeoIpRecord($hostname, $debug = false)
+{
+    try {
+        return getGeoIpReader()->city($hostname);
+    } catch (Throwable $exception) {
+        handleGeoIpError($exception, $debug);
 
-    // South America
-    } elseif ($continent == 'SA') {
-        return array('nyc3', 'sfo1');
-
-    // Africa
-    } elseif ($continent == 'AF') {
-        return array('fra1', 'ams3');
-    } elseif (
-        // Asia
-        $continent == 'AS' ||
-        // Oceania
-        $continent == 'OC' ||
-        // Antarctica
-        $continent == 'AN'
-    ) {
-        return 'sgp1';
-
-    // Other
-    } else {
-        return array('nyc3', 'ams3');
+        return null;
     }
 }
 
-////    getIPHash
-// Hashes the given IP to return either a 0 or a 1 consistently for the same IP.
-// Used when balancing between two regions returned by getDownloadRegion.
+/**
+ * Determines the preferred download region for an IP address.
+ *
+ * A string means that a single region should be used.
+ * An array means that traffic may be balanced between two regions.
+ *
+ * @param string $hostname
+ * @param bool   $debug
+ *
+ * @return string|array
+ */
+function getDownloadRegion($hostname, $debug = false)
+{
+    $record = getGeoIpRecord($hostname, $debug);
+
+    $continent = $record ? $record->continent->code : null;
+    $country = $record ? $record->country->isoCode : null;
+    $longitude = $record ? $record->location->longitude : null;
+
+    if ($debug) {
+        echo 'Continent: "' . ($continent ?? '') . '"' . PHP_EOL;
+        echo 'Country: "' . ($country ?? '') . '"' . PHP_EOL;
+        echo 'Longitude: "' . ($longitude ?? '') . '"' . PHP_EOL;
+    }
+
+    switch ($continent) {
+        case 'NA':
+            return getNorthAmericaRegion($country, $longitude);
+
+        case 'EU':
+            return getEuropeRegion($country);
+
+        case 'SA':
+            return ['nyc3', 'sfo1'];
+
+        case 'AF':
+            return ['fra1', 'ams3'];
+
+        case 'AS':
+        case 'OC':
+        case 'AN':
+            return 'sgp1';
+
+        default:
+            // Graceful fallback when GeoIP is unavailable
+            // or the continent cannot be determined.
+            return ['nyc3', 'ams3'];
+    }
+}
+
+/**
+ * Determines the download region for North America.
+ *
+ * @param string|null $country
+ * @param float|null  $longitude
+ *
+ * @return string|array
+ */
+function getNorthAmericaRegion($country, $longitude)
+{
+    static $westCoastCountries = [
+        'BZ',
+        'CR',
+        'SV',
+        'GT',
+        'HN',
+        'MX',
+        'NI',
+        'PA',
+    ];
+
+    static $eastCoastCountries = [
+        'AG',
+        'BS',
+        'BB',
+        'BM',
+        'VG',
+        'KY',
+        'CU',
+        'DM',
+        'DO',
+        'GL',
+        'GD',
+        'GP',
+        'HT',
+        'JM',
+        'MQ',
+        'MS',
+        'CW',
+        'AW',
+        'SX',
+        'BQ',
+        'PR',
+        'BL',
+        'KN',
+        'AI',
+        'LC',
+        'MF',
+        'PM',
+        'VC',
+        'TT',
+        'TC',
+        'VI',
+    ];
+
+    if (
+        in_array($country, $westCoastCountries, true) ||
+        ($longitude !== null && $longitude < -100)
+    ) {
+        return 'sfo1';
+    }
+
+    if (
+        in_array($country, $eastCoastCountries, true) ||
+        ($longitude !== null && $longitude >= -100)
+    ) {
+        return 'nyc3';
+    }
+
+    return ['nyc3', 'sfo1'];
+}
+
+/**
+ * Determines the download region for Europe.
+ *
+ * @param string|null $country
+ *
+ * @return string|array
+ */
+function getEuropeRegion($country)
+{
+    static $amsCountries = [
+        // British Isles / North Atlantic
+        'GB',
+        'IM',
+        'IE',
+        'FO',
+        'IS',
+        'GG',
+        'JE',
+        'GI',
+
+        // Northern Europe
+        'NL',
+        'SX',
+        'DK',
+        'NO',
+        'SE',
+        'FI',
+        'SJ',
+    ];
+
+    if (in_array($country, $amsCountries, true)) {
+        return 'ams3';
+    }
+
+    return ['ams3', 'fra1'];
+}
+
+/**
+ * Generates a deterministic value (0 or 1) from an IP address.
+ *
+ * Used when balancing traffic between the two regions returned
+ * by getDownloadRegion().
+ *
+ * @param string $hostname
+ * @param bool   $debug
+ *
+ * @return int
+ */
 function getIPHash($hostname, $debug = false)
 {
     $hash = array_sum(str_split($hostname));
+
     if ($debug) {
-        echo 'Hash: "'.$hash.'"'."\n";
+        echo 'Hash: "' . $hash . '"' . PHP_EOL;
     }
-    $hash = $hash % 10;
+
+    $remainder = $hash % 10;
+
     if ($debug) {
-        echo 'Remainder: "'.$hash.'"'."\n";
+        echo 'Remainder: "' . $remainder . '"' . PHP_EOL;
     }
-    if ($hash > 5) {
-        return 0;
-    } else {
-        return 1;
-    }
+
+    return $remainder > 5 ? 0 : 1;
 }
 
+/**
+ * Returns geographical information for an IP address.
+ *
+ * All fields are returned as false when the GeoIP lookup fails,
+ * maintaining compatibility with the previous implementation.
+ *
+ * @param string $hostname
+ * @param bool   $debug
+ *
+ * @return array
+ */
 function getCurrentLocation($hostname, $debug = false)
 {
-
-    try {
-        if ($debug) {
-            echo $hostname."\n";
-        }
-        if (!class_exists('GeoIp2\Database\Reader')) {
-            throw new \Exception('Class GeoIp2\Database\Reader not found');
-        }
-        $reader = new Reader(__DIR__.'/GeoLite2-City.mmdb');
-        $record = $reader->city($hostname);
-
-        $city        = $record->city->name; // 'Minneapolis'
-        $state       = $record->mostSpecificSubdivision->name ; // 'Minnesota'
-        $stateCode   = $record->mostSpecificSubdivision->isoCode; // 'MN'
-        $country     = $record->country->name; // 'United States'
-        $countryCode = $record->country->isoCode; // 'US'
-        $postcode    = $record->postal->code; // '55455'
-        $continent   = $record->continent->code;
-    } catch (\Exception $e) {
-        if ($debug) {
-            echo $e->getMessage();
-        } else {
-            error_log($e->getMessage());
-        }
-
-        $city        = false;
-        $state       = false;
-        $stateCode   = false;
-        $country     = false;
-        $countryCode = false;
-        $postcode    = false;
-        $continent   = false;
+    if ($debug) {
+        echo $hostname . PHP_EOL;
     }
 
-    return array(
-        'city' => $city,
-        'state' => $state,
-        'stateCode' => $stateCode,
-        'country' => $country,
-        'countryCode' => $countryCode,
-        'postcode' => $postcode,
-        'continent' => $continent,
-    );
+    $record = getGeoIpRecord($hostname, $debug);
+
+    if ($record === null) {
+        return emptyLocation();
+    }
+
+    return [
+        'city' => $record->city->name,
+        'state' => $record->mostSpecificSubdivision->name,
+        'stateCode' => $record->mostSpecificSubdivision->isoCode,
+        'country' => $record->country->name,
+        'countryCode' => $record->country->isoCode,
+        'postcode' => $record->postal->code,
+        'continent' => $record->continent->code,
+    ];
 }
+
+/**
+ * Returns an empty location structure.
+ *
+ * @return array
+ */
+function emptyLocation()
+{
+    return [
+        'city' => false,
+        'state' => false,
+        'stateCode' => false,
+        'country' => false,
+        'countryCode' => false,
+        'postcode' => false,
+        'continent' => false,
+    ];
+}
+
