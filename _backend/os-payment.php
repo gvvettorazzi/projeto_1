@@ -1,19 +1,21 @@
 <?php
 
+declare(strict_types=1);
+
 require_once __DIR__ . '/bootstrap.php';
 require_once __DIR__ . '/log-echo.php';
 
 /**
- * Encodes text for use in cookie names.
+ * Encodes text for safe use in cookie names.
  *
  * @param string $text Text to encode.
  * @return string Encoded text.
  */
 function os_payment_encode(string $text): string
 {
-    $text = str_replace([' ', '.'], '_', $text);
+    $normalizedText = str_replace([' ', '.'], '_', trim($text));
 
-    return rawurlencode($text);
+    return rawurlencode($normalizedText);
 }
 
 /**
@@ -33,21 +35,17 @@ function os_payment_setcookie(string $version, int $amount): bool
 
     $cookieName = os_payment_encode("os_payment_{$version}");
 
-    /*
-     * Keep the cookie lifetime limited to one year.
-     * HttpOnly prevents JavaScript access.
-     * Secure ensures the cookie is sent only over HTTPS.
-     * SameSite=Lax reduces CSRF exposure.
-     */
-    $expires = time() + 31536000;
+    if ($cookieName === '') {
+        return false;
+    }
 
     return setcookie(
         $cookieName,
         (string) $amount,
         [
-            'expires'  => $expires,
+            'expires'  => time() + 31536000,
             'path'     => '/',
-            'secure'   => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+            'secure'   => isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
             'httponly' => true,
             'samesite' => 'Lax',
         ]
@@ -64,47 +62,63 @@ function os_payment_getcookie(string $version): int
 {
     $version = trim($version);
 
-    /*
-     * Legacy cookie support.
-     *
-     * $config was previously referenced without being defined in this
-     * function. Only use it when the expected configuration values exist.
-     */
     if ($version === '') {
-        global $config;
+        return os_payment_get_legacy_cookie();
+    }
 
-        if (
-            isset($config['release_title'], $config['release_version'])
-            && is_string($config['release_title'])
-            && is_string($config['release_version'])
-        ) {
-            $legacyCookieName = os_payment_encode(
-                'has_paid_' .
-                $config['release_title'] .
-                '_' .
-                $config['release_version']
-            );
+    $cookieNames = [
+        os_payment_encode("os_payment_{$version}"),
+        os_payment_encode("has_paid_Loki_{$version}"),
+    ];
 
-            if (isset($_COOKIE[$legacyCookieName])) {
-                return os_payment_parse_amount($_COOKIE[$legacyCookieName]);
-            }
+    foreach ($cookieNames as $cookieName) {
+        if (!isset($_COOKIE[$cookieName])) {
+            continue;
         }
 
-        return 0;
-    }
+        $amount = os_payment_parse_amount($_COOKIE[$cookieName]);
 
-    $cookieName = os_payment_encode("os_payment_{$version}");
-    $deprecatedCookieName = os_payment_encode("has_paid_Loki_{$version}");
-
-    if (isset($_COOKIE[$cookieName])) {
-        return os_payment_parse_amount($_COOKIE[$cookieName]);
-    }
-
-    if (isset($_COOKIE[$deprecatedCookieName])) {
-        return os_payment_parse_amount($_COOKIE[$deprecatedCookieName]);
+        if ($amount > 0) {
+            return $amount;
+        }
     }
 
     return 0;
+}
+
+/**
+ * Retrieves the legacy payment cookie.
+ *
+ * @return int Amount paid, or 0 if no valid legacy cookie exists.
+ */
+function os_payment_get_legacy_cookie(): int
+{
+    global $config;
+
+    if (
+        !isset($config['release_title'], $config['release_version'])
+        || !is_string($config['release_title'])
+        || !is_string($config['release_version'])
+    ) {
+        return 0;
+    }
+
+    $releaseTitle = trim($config['release_title']);
+    $releaseVersion = trim($config['release_version']);
+
+    if ($releaseTitle === '' || $releaseVersion === '') {
+        return 0;
+    }
+
+    $cookieName = os_payment_encode(
+        "has_paid_{$releaseTitle}_{$releaseVersion}"
+    );
+
+    if (!isset($_COOKIE[$cookieName])) {
+        return 0;
+    }
+
+    return os_payment_parse_amount($_COOKIE[$cookieName]);
 }
 
 /**
@@ -115,11 +129,15 @@ function os_payment_getcookie(string $version): int
  */
 function os_payment_parse_amount(mixed $value): int
 {
-    if (!is_string($value) && !is_int($value)) {
+    if (is_int($value)) {
+        return $value >= 0 ? $value : 0;
+    }
+
+    if (!is_string($value)) {
         return 0;
     }
 
-    $value = (string) $value;
+    $value = trim($value);
 
     if ($value === '' || !ctype_digit($value)) {
         return 0;
@@ -137,4 +155,3 @@ function os_payment_parse_amount(mixed $value): int
 
     return $amount === false ? 0 : $amount;
 }
-?>
