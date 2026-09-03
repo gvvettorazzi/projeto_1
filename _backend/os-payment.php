@@ -6,218 +6,52 @@ require_once __DIR__ . '/bootstrap.php';
 require_once __DIR__ . '/log-echo.php';
 
 /*
- * SECURITY-HARDENED PAYMENT STATE
- *
- * Design principles:
- *
- * - Client-controlled payment values are NEVER trusted.
- * - Payment state is authenticated and encrypted with libsodium.
- * - Plaintext legacy payment cookies are rejected.
- * - Cookie names do not reveal release identifiers.
- * - __Host- cookies prevent Domain/subdomain cookie injection.
- * - HTTPS is mandatory.
- * - HttpOnly + Secure + SameSite=Strict are enforced.
- * - Passwords use Argon2id, with bcrypt only as a compatibility fallback.
- * - Secret comparisons use hash_equals().
- * - CSRF tokens use CSPRNG and constant-time comparison.
- * - Sessions use strict cookie settings and regeneration.
- * - Authorization uses server-side privileges only.
- * - Authentication failures are intentionally generic.
- * - Rate limiting primitives are provided, but distributed rate limiting
- *   MUST be enforced by the authentication/API layer as well.
- * - Sensitive values are never returned by error helpers.
- * - Security headers are restrictive by default.
+ * Security-first payment state.
  *
  * IMPORTANT:
- * No PHP file can "block all vulnerabilities". Security is a system
- * property. Database access, authorization middleware, reverse proxies,
- * TLS configuration, dependency versions, filesystem permissions, deployment,
- * payment-provider verification and infrastructure rate limiting must also
- * be hardened.
+ * The browser is an untrusted environment.
  *
- * OWASP guidance recommends:
- * - Argon2id for password storage.
- * - Secure, server-side session management.
- * - Secure/HttpOnly/SameSite cookies.
- * - Session ID regeneration after authentication/privilege changes.
- * - Defense-in-depth against brute force.
- * - Generic authentication errors.
- * - Reauthentication for sensitive operations.
+ * The payment amount MUST be stored server-side.
+ * The cookie contains only an opaque, random identifier.
  *
- * References:
- * OWASP Authentication Cheat Sheet
- * OWASP Session Management Cheat Sheet
+ * Recommended server-side record:
+ *
+ *   payment_token_hash
+ *   release_version
+ *   amount
+ *   user_id
+ *   created_at
+ *   expires_at
+ *   revoked_at
+ *
+ * The database record must be protected by the application's authorization
+ * layer and must never be exposed directly to the client.
+ *
+ * This design prevents:
+ *
+ * - client-side amount manipulation;
+ * - disclosure of payment amounts through cookies;
+ * - cookie replay after server-side revocation;
+ * - release-name disclosure;
+ * - subdomain cookie injection;
+ * - plaintext payment information in browser storage.
  */
-
-/* ==========================================================================
- * CONSTANTS
- * ========================================================================== */
 
 const OS_PAYMENT_MAX_VERSION_LENGTH = 128;
-const OS_PAYMENT_MAX_COOKIE_VALUE_LENGTH = 4096;
-
-/*
- * Payment state should generally have a much shorter lifetime than a
- * traditional persistent preference. Kept at the original one-year value
- * for functional compatibility.
- */
+const OS_PAYMENT_TOKEN_BYTES = 32;
 const OS_PAYMENT_COOKIE_LIFETIME = 31536000;
-
 const OS_PAYMENT_COOKIE_PREFIX = '__Host-os_payment_';
-
-const OS_PAYMENT_CRYPTO_VERSION = 1;
-
-/*
- * Password policy.
- *
- * OWASP/NIST guidance favors long passwords/passphrases over composition
- * rules. Do not silently truncate passwords.
- */
-const OS_PAYMENT_PASSWORD_MIN_LENGTH = 15;
-const OS_PAYMENT_PASSWORD_MAX_BYTES = 1024;
-
-/*
- * Argon2id parameters.
- *
- * These are intentionally configurable through constants so they can be
- * benchmarked and increased on production infrastructure.
- */
-const OS_PAYMENT_ARGON2_MEMORY_COST = 19456;
-const OS_PAYMENT_ARGON2_TIME_COST = 2;
-const OS_PAYMENT_ARGON2_THREADS = 1;
-
-const OS_PAYMENT_BCRYPT_COST = 12;
-
-/*
- * Brute-force protection policy.
- *
- * This file only defines policy. Actual distributed counters should be
- * implemented using Redis/database/WAF/API-gateway infrastructure.
- */
-const OS_PAYMENT_AUTH_MAX_ATTEMPTS = 5;
-const OS_PAYMENT_AUTH_WINDOW_SECONDS = 900;
-
-/*
- * Session inactivity / absolute lifetimes.
- */
-const OS_PAYMENT_SESSION_IDLE_TIMEOUT = 1800;
-const OS_PAYMENT_SESSION_ABSOLUTE_TIMEOUT = 43200;
-
-/*
- * Maximum request sizes accepted by helper functions.
- */
-const OS_PAYMENT_MAX_TOKEN_LENGTH = 4096;
-const OS_PAYMENT_MAX_IDENTIFIER_LENGTH = 512;
-
-/* ==========================================================================
- * HTTPS / TRANSPORT
- * ========================================================================== */
-
-/**
- * Determines whether the application is operating over HTTPS.
- *
- * Do not trust arbitrary X-Forwarded-Proto headers here.
- *
- * If the application is behind a reverse proxy, TLS termination must be
- * configured so that HTTPS is established and enforced by trusted
- * infrastructure before reaching this application.
- */
-function os_payment_is_https(): bool
-{
-    return isset($_SERVER['HTTPS'])
-        && strtolower((string) $_SERVER['HTTPS']) === 'on';
-}
-
-/**
- * Refuse security-sensitive operations over HTTP.
- */
-function os_payment_require_https(): bool
-{
-    return os_payment_is_https();
-}
-
-/* ==========================================================================
- * RANDOMNESS / ENCODING
- * ========================================================================== */
-
-/**
- * Generates cryptographically secure random bytes.
- */
-function os_payment_random_bytes(int $length): ?string
-{
-    if ($length < 1 || $length > 4096) {
-        return null;
-    }
-
-    try {
-        return random_bytes($length);
-    } catch (Throwable) {
-        return null;
-    }
-}
-
-/**
- * Encodes binary data using Base64URL without padding.
- */
-function os_payment_base64url_encode(string $data): string
-{
-    return rtrim(
-        strtr(base64_encode($data), '+/', '-_'),
-        '='
-    );
-}
-
-/**
- * Strict Base64URL decoder.
- */
-function os_payment_base64url_decode(mixed $value): ?string
-{
-    if (!is_string($value)) {
-        return null;
-    }
-
-    if (
-        $value === ''
-        || strlen($value) > OS_PAYMENT_MAX_COOKIE_VALUE_LENGTH
-        || preg_match('/\A[A-Za-z0-9_-]+\z/D', $value) !== 1
-    ) {
-        return null;
-    }
-
-    $padding = strlen($value) % 4;
-
-    if ($padding !== 0) {
-        $value .= str_repeat('=', 4 - $padding);
-    }
-
-    $decoded = base64_decode(
-        strtr($value, '-_', '+/'),
-        true
-    );
-
-    return $decoded === false ? null : $decoded;
-}
-
-/**
- * Constant-time comparison for secrets.
- */
-function os_payment_secure_equals(
-    string $known,
-    string $provided
-): bool {
-    return hash_equals($known, $provided);
-}
-
-/* ==========================================================================
- * RELEASE VALIDATION
- * ========================================================================== */
 
 /**
  * Validates a release version.
+ *
+ * Only application-generated release identifiers should reach this function.
+ *
+ * @param string $version
+ * @return string|null
  */
-function os_payment_normalize_version(
-    string $version
-): ?string {
+function os_payment_normalize_version(string $version): ?string
+{
     $version = trim($version);
 
     if (
@@ -237,409 +71,135 @@ function os_payment_normalize_version(
 /**
  * Generates an opaque cookie name.
  *
- * The release version itself is not exposed.
+ * The actual release version is not disclosed to the browser.
+ *
+ * @param string $version
+ * @return string|null
  */
-function os_payment_cookie_name(
-    string $version
-): ?string {
+function os_payment_cookie_name(string $version): ?string
+{
     $version = os_payment_normalize_version($version);
 
     if ($version === null) {
         return null;
     }
 
-    $digest = hash(
-        'sha256',
-        $version,
-        true
-    );
+    /*
+     * SHA-256 is used only as a public identifier derivation function.
+     * It is NOT being used for password storage or authentication.
+     */
+    $digest = hash('sha256', $version, true);
 
     return OS_PAYMENT_COOKIE_PREFIX
-        . os_payment_base64url_encode($digest);
+        . rtrim(
+            strtr(
+                base64_encode($digest),
+                '+/',
+                '-_'
+            ),
+            '='
+        );
 }
 
-/* ==========================================================================
- * SERVER-SIDE CRYPTOGRAPHIC KEY
- * ========================================================================== */
-
 /**
- * Retrieves the encryption key.
+ * Generates an opaque payment reference.
  *
- * Production recommendation:
- * Store this in a dedicated secret manager/KMS/Vault/environment secret,
- * never in source control and never in a client-accessible file.
+ * The returned value contains no payment amount, user ID or other
+ * application information.
  *
- * Accepted:
- * - 64-character hexadecimal key
- * - Base64 containing exactly 32 bytes
- * - raw 32-byte binary key
+ * @return string|null
  */
-function os_payment_get_key(): ?string
+function os_payment_generate_token(): ?string
 {
-    global $config;
-
-    $configuredKey = null;
-
-    if (
-        is_array($config ?? null)
-        && isset($config['payment_cookie_key'])
-        && is_string($config['payment_cookie_key'])
-    ) {
-        $configuredKey = $config['payment_cookie_key'];
-    }
-
-    if ($configuredKey === null || $configuredKey === '') {
-        $environmentKey = getenv('PAYMENT_COOKIE_KEY');
-
-        if (
-            is_string($environmentKey)
-            && $environmentKey !== ''
-        ) {
-            $configuredKey = $environmentKey;
-        }
-    }
-
-    if (!is_string($configuredKey) || $configuredKey === '') {
+    try {
+        $token = random_bytes(OS_PAYMENT_TOKEN_BYTES);
+    } catch (Throwable) {
         return null;
     }
 
-    /*
-     * Preferred representation.
-     */
-    if (
-        strlen($configuredKey) === 64
-        && ctype_xdigit($configuredKey)
-    ) {
-        $decoded = hex2bin($configuredKey);
-
-        if (
-            $decoded !== false
-            && strlen($decoded)
-                === SODIUM_CRYPTO_SECRETBOX_KEYBYTES
-        ) {
-            return $decoded;
-        }
-    }
-
-    /*
-     * Base64 representation.
-     */
-    $decoded = base64_decode(
-        $configuredKey,
-        true
+    return rtrim(
+        strtr(
+            base64_encode($token),
+            '+/',
+            '-_'
+        ),
+        '='
     );
-
-    if (
-        $decoded !== false
-        && strlen($decoded)
-            === SODIUM_CRYPTO_SECRETBOX_KEYBYTES
-    ) {
-        return $decoded;
-    }
-
-    /*
-     * Raw binary representation.
-     */
-    if (
-        strlen($configuredKey)
-        === SODIUM_CRYPTO_SECRETBOX_KEYBYTES
-    ) {
-        return $configuredKey;
-    }
-
-    return null;
 }
 
 /**
- * Generates a new 256-bit payment encryption key.
+ * Hashes a payment token before it is persisted server-side.
  *
- * The returned value should be provisioned into a secret manager.
+ * The raw token should NEVER be stored in the database.
+ *
+ * @param string $token
+ * @return string
  */
-function os_payment_generate_key(): ?string
+function os_payment_hash_token(string $token): string
 {
-    $key = os_payment_random_bytes(
-        SODIUM_CRYPTO_SECRETBOX_KEYBYTES
-    );
-
-    return $key === null
-        ? null
-        : bin2hex($key);
+    return hash('sha256', $token);
 }
 
-/* ==========================================================================
- * PAYMENT AMOUNT VALIDATION
- * ========================================================================== */
-
 /**
- * Parses an amount without implicit type coercion.
- */
-function os_payment_parse_amount(
-    mixed $value
-): ?int {
-    if (!is_string($value)) {
-        return null;
-    }
-
-    /*
-     * Only canonical unsigned decimal integers.
-     *
-     * Rejected:
-     *   "10abc"
-     *   "10.5"
-     *   "+10"
-     *   "-1"
-     *   " 10 "
-     *   "1e3"
-     *   hexadecimal values
-     */
-    if (
-        $value === ''
-        || strlen($value) > 19
-        || preg_match(
-            '/\A(?:0|[1-9][0-9]*)\z/D',
-            $value
-        ) !== 1
-    ) {
-        return null;
-    }
-
-    $maximum = (string) PHP_INT_MAX;
-
-    /*
-     * Explicit overflow protection.
-     */
-    if (
-        strlen($value) > strlen($maximum)
-        || (
-            strlen($value) === strlen($maximum)
-            && strcmp($value, $maximum) > 0
-        )
-    ) {
-        return null;
-    }
-
-    $amount = filter_var(
-        $value,
-        FILTER_VALIDATE_INT,
-        [
-            'options' => [
-                'min_range' => 0,
-            ],
-        ]
-    );
-
-    return $amount === false
-        ? null
-        : $amount;
-}
-
-/* ==========================================================================
- * AUTHENTICATED ENCRYPTION
- * ========================================================================== */
-
-/**
- * Encrypts payment state using authenticated encryption.
+ * Constant-time comparison of token hashes.
  *
- * Sodium secretbox provides:
- * - confidentiality
- * - integrity
- * - authenticity
- *
- * An attacker who modifies the cookie cannot produce valid payment state
- * without possession of the server-side key.
+ * @param string $storedHash
+ * @param string $providedHash
+ * @return bool
  */
-function os_payment_encrypt_amount(
-    int $amount
-): ?string {
-    if ($amount < 0) {
-        return null;
+function os_payment_token_matches(
+    string $storedHash,
+    string $providedHash
+): bool {
+    if (
+        $storedHash === ''
+        || $providedHash === ''
+        || strlen($storedHash) !== 64
+        || strlen($providedHash) !== 64
+    ) {
+        return false;
     }
 
-    $key = os_payment_get_key();
-
-    if ($key === null) {
-        return null;
-    }
-
-    $nonce = os_payment_random_bytes(
-        SODIUM_CRYPTO_SECRETBOX_NONCEBYTES
-    );
-
-    if ($nonce === null) {
-        return null;
-    }
-
-    try {
-        $plaintext = json_encode(
-            [
-                'v' => OS_PAYMENT_CRYPTO_VERSION,
-                'amount' => (string) $amount,
-            ],
-            JSON_THROW_ON_ERROR
-            | JSON_UNESCAPED_SLASHES
-        );
-
-        $ciphertext = sodium_crypto_secretbox(
-            $plaintext,
-            $nonce,
-            $key
-        );
-    } catch (Throwable) {
-        return null;
-    }
-
-    return os_payment_base64url_encode(
-        chr(OS_PAYMENT_CRYPTO_VERSION)
-        . $nonce
-        . $ciphertext
+    return hash_equals(
+        $storedHash,
+        $providedHash
     );
 }
 
 /**
- * Decrypts and authenticates payment state.
+ * Returns the payment cookie lifetime.
+ *
+ * @return int
  */
-function os_payment_decrypt_amount(
-    mixed $value
-): ?int {
-    if (!is_string($value)) {
-        return null;
-    }
-
-    if (
-        $value === ''
-        || strlen($value)
-            > OS_PAYMENT_MAX_COOKIE_VALUE_LENGTH
-    ) {
-        return null;
-    }
-
-    $encoded = os_payment_base64url_decode($value);
-
-    if ($encoded === null) {
-        return null;
-    }
-
-    $minimumLength =
-        1
-        + SODIUM_CRYPTO_SECRETBOX_NONCEBYTES
-        + SODIUM_CRYPTO_SECRETBOX_MACBYTES;
-
-    if (strlen($encoded) < $minimumLength) {
-        return null;
-    }
-
-    $version = ord($encoded[0]);
-
-    if ($version !== OS_PAYMENT_CRYPTO_VERSION) {
-        return null;
-    }
-
-    $nonce = substr(
-        $encoded,
-        1,
-        SODIUM_CRYPTO_SECRETBOX_NONCEBYTES
-    );
-
-    $ciphertext = substr(
-        $encoded,
-        1 + SODIUM_CRYPTO_SECRETBOX_NONCEBYTES
-    );
-
-    if (
-        $nonce === false
-        || $ciphertext === false
-        || $ciphertext === ''
-    ) {
-        return null;
-    }
-
-    $key = os_payment_get_key();
-
-    if ($key === null) {
-        return null;
-    }
-
-    try {
-        /*
-         * Authentication is verified by libsodium before plaintext is
-         * returned.
-         */
-        $plaintext = sodium_crypto_secretbox_open(
-            $ciphertext,
-            $nonce,
-            $key
-        );
-    } catch (Throwable) {
-        return null;
-    }
-
-    if ($plaintext === false) {
-        return null;
-    }
-
-    try {
-        $payload = json_decode(
-            $plaintext,
-            true,
-            8,
-            JSON_THROW_ON_ERROR
-        );
-    } catch (Throwable) {
-        return null;
-    }
-
-    if (
-        !is_array($payload)
-        || ($payload['v'] ?? null)
-            !== OS_PAYMENT_CRYPTO_VERSION
-        || !isset($payload['amount'])
-        || !is_string($payload['amount'])
-    ) {
-        return null;
-    }
-
-    return os_payment_parse_amount(
-        $payload['amount']
-    );
+function os_payment_cookie_lifetime(): int
+{
+    return OS_PAYMENT_COOKIE_LIFETIME;
 }
 
-/* ==========================================================================
- * PAYMENT COOKIE API
- * ========================================================================== */
-
 /**
- * Writes the secure payment cookie.
+ * Creates the payment cookie.
  *
- * The operation fails closed unless HTTPS and cryptographic configuration
- * are available.
+ * IMPORTANT:
+ * The amount is deliberately NOT stored in the cookie.
+ *
+ * The caller must first create a server-side payment record and then pass
+ * the opaque token returned by that operation.
+ *
+ * @param string $version
+ * @param string $token
+ * @return bool
  */
 function os_payment_setcookie(
     string $version,
-    int $amount
+    string $token
 ): bool {
-    $version = os_payment_normalize_version($version);
-
-    if (
-        $version === null
-        || $amount < 0
-        || !os_payment_require_https()
-        || !function_exists('sodium_crypto_secretbox')
-    ) {
-        return false;
-    }
-
     $cookieName = os_payment_cookie_name($version);
 
-    if ($cookieName === null) {
-        return false;
-    }
-
-    $cookieValue = os_payment_encrypt_amount($amount);
-
     if (
-        $cookieValue === null
-        || strlen($cookieValue)
-            > OS_PAYMENT_MAX_COOKIE_VALUE_LENGTH
+        $cookieName === null
+        || $token === ''
+        || strlen($token) > 512
+        || !os_payment_is_https()
     ) {
         return false;
     }
@@ -647,18 +207,19 @@ function os_payment_setcookie(
     /*
      * __Host- cookie requirements:
      *
-     * Secure
+     * Secure=true
      * Path=/
-     * no Domain
+     * no Domain attribute
      *
-     * This protects against many subdomain cookie-injection scenarios.
+     * This prevents weaker cookie scoping and reduces subdomain
+     * cookie-injection risks.
      */
     return setcookie(
         $cookieName,
-        $cookieValue,
+        $token,
         [
-            'expires' =>
-                time() + OS_PAYMENT_COOKIE_LIFETIME,
+            'expires' => time()
+                + OS_PAYMENT_COOKIE_LIFETIME,
             'path' => '/',
             'secure' => true,
             'httponly' => true,
@@ -668,60 +229,63 @@ function os_payment_setcookie(
 }
 
 /**
- * Reads authenticated payment state.
+ * Retrieves the opaque payment token.
  *
- * IMPORTANT:
- * The browser is not trusted.
+ * No payment amount is read from the client.
+ *
+ * @param string $version
+ * @return string|null
  */
 function os_payment_getcookie(
     string $version
-): int {
-    $version = os_payment_normalize_version($version);
-
-    if ($version === null) {
-        return 0;
-    }
-
+): ?string {
     $cookieName = os_payment_cookie_name($version);
 
     if (
         $cookieName === null
-        || !array_key_exists(
-            $cookieName,
-            $_COOKIE
-        )
+        || !isset($_COOKIE[$cookieName])
+        || !is_string($_COOKIE[$cookieName])
     ) {
-        return 0;
+        return null;
     }
 
-    $amount = os_payment_decrypt_amount(
-        $_COOKIE[$cookieName]
-    );
+    $token = $_COOKIE[$cookieName];
 
     /*
-     * Fail closed.
+     * The token is expected to be Base64URL.
+     *
+     * This prevents arbitrary data from being passed into downstream
+     * database/application operations.
      */
-    return $amount ?? 0;
+    if (
+        $token === ''
+        || strlen($token) > 512
+        || preg_match(
+            '/\A[A-Za-z0-9_-]+\z/D',
+            $token
+        ) !== 1
+    ) {
+        return null;
+    }
+
+    return $token;
 }
 
 /**
- * Removes the secure payment cookie.
+ * Removes the payment cookie.
+ *
+ * @param string $version
+ * @return bool
  */
 function os_payment_clearcookie(
     string $version
 ): bool {
-    $version = os_payment_normalize_version($version);
-
-    if (
-        $version === null
-        || !os_payment_require_https()
-    ) {
-        return false;
-    }
-
     $cookieName = os_payment_cookie_name($version);
 
-    if ($cookieName === null) {
+    if (
+        $cookieName === null
+        || !os_payment_is_https()
+    ) {
         return false;
     }
 
@@ -739,43 +303,42 @@ function os_payment_clearcookie(
 }
 
 /**
- * Legacy plaintext payment cookies are NEVER trusted.
+ * HTTPS detection.
  *
- * Returning zero ensures an attacker cannot bypass the authenticated cookie
- * format by manipulating an old cookie.
+ * Do not trust arbitrary client-controlled forwarding headers.
+ *
+ * @return bool
  */
-function os_payment_get_legacy_cookie(): int
+function os_payment_is_https(): bool
 {
-    return 0;
-}
-
-/* ==========================================================================
- * PASSWORD SECURITY
- * ========================================================================== */
-
-/**
- * Validates password size.
- *
- * No character-composition restrictions are imposed.
- */
-function os_payment_password_is_valid(
-    string $password
-): bool {
-    $length = strlen($password);
-
-    return $length >= OS_PAYMENT_PASSWORD_MIN_LENGTH
-        && $length <= OS_PAYMENT_PASSWORD_MAX_BYTES;
+    return isset($_SERVER['HTTPS'])
+        && strtolower(
+            (string) $_SERVER['HTTPS']
+        ) === 'on';
 }
 
 /**
- * Creates an Argon2id password hash.
+ * Securely hashes a password.
  *
- * Bcrypt is only a compatibility fallback.
+ * Argon2id is preferred.
+ * Bcrypt is retained only for environments where Argon2id is unavailable.
+ *
+ * @param string $password
+ * @return string|null
  */
 function os_payment_password_hash(
     string $password
 ): ?string {
-    if (!os_payment_password_is_valid($password)) {
+    /*
+     * Do not silently truncate passwords.
+     *
+     * A maximum size protects the application from pathological requests
+     * while still allowing long passphrases.
+     */
+    if (
+        $password === ''
+        || strlen($password) > 1024
+    ) {
         return null;
     }
 
@@ -785,12 +348,9 @@ function os_payment_password_hash(
                 $password,
                 PASSWORD_ARGON2ID,
                 [
-                    'memory_cost'
-                        => OS_PAYMENT_ARGON2_MEMORY_COST,
-                    'time_cost'
-                        => OS_PAYMENT_ARGON2_TIME_COST,
-                    'threads'
-                        => OS_PAYMENT_ARGON2_THREADS,
+                    'memory_cost' => 19456,
+                    'time_cost' => 2,
+                    'threads' => 1,
                 ]
             );
         } else {
@@ -798,7 +358,7 @@ function os_payment_password_hash(
                 $password,
                 PASSWORD_BCRYPT,
                 [
-                    'cost' => OS_PAYMENT_BCRYPT_COST,
+                    'cost' => 12,
                 ]
             );
         }
@@ -812,34 +372,36 @@ function os_payment_password_hash(
 }
 
 /**
- * Securely verifies a password.
+ * Verifies a password.
  *
- * Never compare password hashes manually.
+ * @param string $password
+ * @param string $hash
+ * @return bool
  */
 function os_payment_password_verify(
     string $password,
     string $hash
 ): bool {
     if (
-        !os_payment_password_is_valid($password)
+        $password === ''
+        || strlen($password) > 1024
         || $hash === ''
         || strlen($hash) > 1024
     ) {
         return false;
     }
 
-    try {
-        return password_verify(
-            $password,
-            $hash
-        );
-    } catch (Throwable) {
-        return false;
-    }
+    return password_verify(
+        $password,
+        $hash
+    );
 }
 
 /**
- * Determines whether an existing password hash should be upgraded.
+ * Determines whether a password hash should be upgraded.
+ *
+ * @param string $hash
+ * @return bool
  */
 function os_payment_password_needs_rehash(
     string $hash
@@ -851,54 +413,47 @@ function os_payment_password_needs_rehash(
         return false;
     }
 
-    try {
-        if (defined('PASSWORD_ARGON2ID')) {
-            return password_needs_rehash(
-                $hash,
-                PASSWORD_ARGON2ID,
-                [
-                    'memory_cost'
-                        => OS_PAYMENT_ARGON2_MEMORY_COST,
-                    'time_cost'
-                        => OS_PAYMENT_ARGON2_TIME_COST,
-                    'threads'
-                        => OS_PAYMENT_ARGON2_THREADS,
-                ]
-            );
-        }
-
+    if (defined('PASSWORD_ARGON2ID')) {
         return password_needs_rehash(
             $hash,
-            PASSWORD_BCRYPT,
+            PASSWORD_ARGON2ID,
             [
-                'cost' => OS_PAYMENT_BCRYPT_COST,
+                'memory_cost' => 19456,
+                'time_cost' => 2,
+                'threads' => 1,
             ]
         );
-    } catch (Throwable) {
-        return false;
     }
+
+    return password_needs_rehash(
+        $hash,
+        PASSWORD_BCRYPT,
+        [
+            'cost' => 12,
+        ]
+    );
 }
 
-/* ==========================================================================
- * SESSION SECURITY
- * ========================================================================== */
-
 /**
- * Configures PHP's native session mechanism.
+ * Configures secure PHP sessions.
  *
  * Call BEFORE session_start().
+ *
+ * @return bool
  */
 function os_payment_configure_session(): bool
 {
-    if (!os_payment_require_https()) {
+    if (!os_payment_is_https()) {
         return false;
     }
 
-    /*
-     * Prevent session IDs from appearing in URLs.
-     */
     ini_set(
         'session.use_only_cookies',
+        '1'
+    );
+
+    ini_set(
+        'session.use_strict_mode',
         '1'
     );
 
@@ -907,36 +462,14 @@ function os_payment_configure_session(): bool
         '0'
     );
 
-    /*
-     * Reject attacker-supplied uninitialized session IDs.
-     */
-    ini_set(
-        'session.use_strict_mode',
-        '1'
-    );
-
-    /*
-     * Protect the cookie from JavaScript.
-     */
-    ini_set(
-        'session.cookie_httponly',
-        '1'
-    );
-
-    /*
-     * HTTPS only.
-     */
     ini_set(
         'session.cookie_secure',
         '1'
     );
 
-    /*
-     * Reduce session lifetime.
-     */
     ini_set(
-        'session.gc_maxlifetime',
-        (string) OS_PAYMENT_SESSION_ABSOLUTE_TIMEOUT
+        'session.cookie_httponly',
+        '1'
     );
 
     if (PHP_VERSION_ID >= 70300) {
@@ -953,9 +486,9 @@ function os_payment_configure_session(): bool
 }
 
 /**
- * Regenerates the session identifier.
+ * Regenerates the session identifier after authentication.
  *
- * Must be called immediately after authentication and privilege changes.
+ * @return bool
  */
 function os_payment_regenerate_session(): bool
 {
@@ -970,167 +503,9 @@ function os_payment_regenerate_session(): bool
 }
 
 /**
- * Logs the user out securely.
- */
-function os_payment_logout(): bool
-{
-    if (
-        session_status()
-        !== PHP_SESSION_ACTIVE
-    ) {
-        return false;
-    }
-
-    /*
-     * Remove server-side state first.
-     */
-    $_SESSION = [];
-
-    /*
-     * Expire the client-side session cookie.
-     */
-    if (ini_get('session.use_cookies')) {
-        $params = session_get_cookie_params();
-
-        setcookie(
-            session_name(),
-            '',
-            [
-                'expires' => 1,
-                'path' =>
-                    $params['path'] ?? '/',
-                'domain' =>
-                    $params['domain'] ?? '',
-                'secure' => true,
-                'httponly' => true,
-                'samesite' => 'Strict',
-            ]
-        );
-    }
-
-    return session_destroy();
-}
-
-/**
- * Checks server-side session freshness.
- */
-function os_payment_session_is_valid(): bool
-{
-    if (
-        session_status()
-        !== PHP_SESSION_ACTIVE
-    ) {
-        return false;
-    }
-
-    $now = time();
-
-    if (
-        isset($_SESSION['created_at'])
-        && is_int($_SESSION['created_at'])
-        && (
-            $now - $_SESSION['created_at']
-            > OS_PAYMENT_SESSION_ABSOLUTE_TIMEOUT
-        )
-    ) {
-        return false;
-    }
-
-    if (
-        isset($_SESSION['last_activity'])
-        && is_int($_SESSION['last_activity'])
-        && (
-            $now - $_SESSION['last_activity']
-            > OS_PAYMENT_SESSION_IDLE_TIMEOUT
-        )
-    ) {
-        return false;
-    }
-
-    /*
-     * Do not accept client-controlled timestamps.
-     */
-    if (!isset($_SESSION['created_at'])) {
-        $_SESSION['created_at'] = $now;
-    }
-
-    $_SESSION['last_activity'] = $now;
-
-    return true;
-}
-
-/* ==========================================================================
- * AUTHORIZATION
- * ========================================================================== */
-
-/**
- * Checks a privilege stored in trusted server-side session state.
+ * Creates a CSRF token associated with the server-side session.
  *
- * Never pass a role/privilege obtained from:
- * - $_GET
- * - $_POST
- * - $_COOKIE
- * - request headers
- * - JSON body
- *
- * Authorization data must originate from trusted server-side state.
- */
-function os_payment_authorized(
-    string $requiredPrivilege,
-    array $session
-): bool {
-    if (
-        $requiredPrivilege === ''
-        || !isset($session['privileges'])
-        || !is_array($session['privileges'])
-    ) {
-        return false;
-    }
-
-    foreach ($session['privileges'] as $privilege) {
-        if (
-            is_string($privilege)
-            && os_payment_secure_equals(
-                $requiredPrivilege,
-                $privilege
-            )
-        ) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/**
- * Requires authentication AND a specific privilege.
- */
-function os_payment_require_privilege(
-    string $requiredPrivilege
-): bool {
-    if (
-        session_status()
-        !== PHP_SESSION_ACTIVE
-    ) {
-        return false;
-    }
-
-    if (!os_payment_session_is_valid()) {
-        return false;
-    }
-
-    return os_payment_authorized(
-        $requiredPrivilege,
-        $_SESSION
-    );
-}
-
-/* ==========================================================================
- * CSRF PROTECTION
- * ========================================================================== */
-
-/**
- * Creates/retrieves a per-session CSRF token.
+ * @return string|null
  */
 function os_payment_csrf_token(): ?string
 {
@@ -1149,15 +524,13 @@ function os_payment_csrf_token(): ?string
         return $_SESSION['csrf_token'];
     }
 
-    $random = os_payment_random_bytes(32);
-
-    if ($random === null) {
+    try {
+        $token = bin2hex(
+            random_bytes(32)
+        );
+    } catch (Throwable) {
         return null;
     }
-
-    $token = os_payment_base64url_encode(
-        $random
-    );
 
     $_SESSION['csrf_token'] = $token;
 
@@ -1166,6 +539,9 @@ function os_payment_csrf_token(): ?string
 
 /**
  * Validates a CSRF token.
+ *
+ * @param mixed $provided
+ * @return bool
  */
 function os_payment_verify_csrf(
     mixed $provided
@@ -1181,99 +557,51 @@ function os_payment_verify_csrf(
     }
 
     if (
-        strlen($provided) < 32
-        || strlen($provided) > 512
+        strlen($provided) !== 64
+        || preg_match(
+            '/\A[0-9a-f]{64}\z/D',
+            $provided
+        ) !== 1
     ) {
         return false;
     }
 
-    return os_payment_secure_equals(
+    return hash_equals(
         $_SESSION['csrf_token'],
         $provided
     );
 }
 
-/* ==========================================================================
- * BRUTE FORCE / RATE LIMITING
- * ========================================================================== */
-
 /**
- * Creates a privacy-preserving rate-limit key.
+ * Generates a server-side rate-limit identifier.
  *
- * The raw identifier should never be logged or exposed.
+ * The raw identifier should not be persisted or logged.
  *
- * A production implementation must use an atomic shared store such as
- * Redis/database infrastructure rather than PHP process memory.
+ * @param string $identifier
+ * @return string
  */
 function os_payment_rate_limit_key(
     string $identifier
-): ?string {
-    if (
-        $identifier === ''
-        || strlen($identifier)
-            > OS_PAYMENT_MAX_IDENTIFIER_LENGTH
-    ) {
-        return null;
-    }
-
-    $key = os_payment_get_key();
-
-    if ($key === null) {
-        return null;
-    }
-
-    return hash_hmac(
+): string {
+    /*
+     * The identifier is deliberately hashed before being used by a
+     * distributed rate-limiting system.
+     *
+     * A production implementation should use Redis or another atomic,
+     * shared store.
+     */
+    return hash(
         'sha256',
-        $identifier,
-        $key
+        $identifier
     );
 }
 
 /**
- * Returns the authentication rate-limit policy.
- */
-function os_payment_rate_limit_policy(): array
-{
-    return [
-        'max_attempts'
-            => OS_PAYMENT_AUTH_MAX_ATTEMPTS,
-        'window_seconds'
-            => OS_PAYMENT_AUTH_WINDOW_SECONDS,
-    ];
-}
-
-/**
- * Generates an opaque authentication token.
+ * Returns a generic authentication failure.
  *
- * Do not put identity/privilege information inside the token.
- */
-function os_payment_generate_auth_token(): ?string
-{
-    $random = os_payment_random_bytes(32);
-
-    if ($random === null) {
-        return null;
-    }
-
-    return os_payment_base64url_encode(
-        $random
-    );
-}
-
-/* ==========================================================================
- * AUTHENTICATION FAILURE / INFORMATION DISCLOSURE
- * ========================================================================== */
-
-/**
- * Generic authentication failure.
+ * The caller must not reveal whether the username/account exists.
  *
- * The same result should be used for:
- * - unknown account
- * - wrong password
- * - disabled account
- * - invalid credential
- *
- * This reduces account enumeration.
+ * @return bool
  */
 function os_payment_authentication_failure(): bool
 {
@@ -1281,24 +609,9 @@ function os_payment_authentication_failure(): bool
 }
 
 /**
- * Redacts sensitive information.
+ * Sends restrictive security headers.
  *
- * Never log the underlying value.
- */
-function os_payment_redact(
-    mixed $value
-): string {
-    return '[REDACTED]';
-}
-
-/* ==========================================================================
- * SECURITY HEADERS
- * ========================================================================== */
-
-/**
- * Sends defensive HTTP security headers.
- *
- * Must be called before output is generated.
+ * Must be called before output.
  */
 function os_payment_send_security_headers(): void
 {
@@ -1306,56 +619,34 @@ function os_payment_send_security_headers(): void
         return;
     }
 
-    /*
-     * Sensitive/payment responses should not be cached.
-     */
     header(
-        'Cache-Control: no-store, no-cache, must-revalidate, max-age=0'
+        'Cache-Control: no-store'
     );
 
-    header('Pragma: no-cache');
-    header('Expires: 0');
+    header(
+        'Pragma: no-cache'
+    );
 
-    /*
-     * MIME sniffing protection.
-     */
     header(
         'X-Content-Type-Options: nosniff'
     );
 
-    /*
-     * Clickjacking protection.
-     */
     header(
         'X-Frame-Options: DENY'
     );
 
-    /*
-     * Avoid leaking URLs through Referer.
-     */
     header(
         'Referrer-Policy: no-referrer'
     );
 
-    /*
-     * Disable unnecessary browser capabilities.
-     */
     header(
         'Permissions-Policy: ' .
         'camera=(), ' .
         'microphone=(), ' .
         'geolocation=(), ' .
-        'payment=(), ' .
-        'usb=(), ' .
-        'bluetooth=()'
+        'payment=()'
     );
 
-    /*
-     * Strict CSP.
-     *
-     * If the surrounding application legitimately requires inline scripts,
-     * replace this with nonce-based CSP rather than adding unsafe-inline.
-     */
     header(
         'Content-Security-Policy: ' .
         "default-src 'self'; " .
@@ -1367,13 +658,9 @@ function os_payment_send_security_headers(): void
         "style-src 'self'; " .
         "img-src 'self' data:; " .
         "font-src 'self'; " .
-        "connect-src 'self';"
+        "connect-src 'self'"
     );
 
-    /*
-     * HSTS is safe only when HTTPS is guaranteed for the entire host and
-     * all included subdomains.
-     */
     if (os_payment_is_https()) {
         header(
             'Strict-Transport-Security: ' .
@@ -1382,153 +669,29 @@ function os_payment_send_security_headers(): void
     }
 }
 
-/* ==========================================================================
- * HTTP METHOD / REQUEST PROTECTION
- * ========================================================================== */
-
 /**
- * Strictly validates an HTTP method.
+ * Redacts sensitive values from logs/errors.
  *
- * Use this before state-changing operations.
+ * Never log the actual value.
+ *
+ * @param mixed $value
+ * @return string
  */
-function os_payment_require_method(
-    string $expectedMethod
-): bool {
-    $expectedMethod = strtoupper(
-        trim($expectedMethod)
-    );
-
-    $actualMethod = strtoupper(
-        (string) ($_SERVER['REQUEST_METHOD'] ?? '')
-    );
-
-    if (
-        $expectedMethod === ''
-        || $actualMethod === ''
-    ) {
-        return false;
-    }
-
-    return os_payment_secure_equals(
-        $expectedMethod,
-        $actualMethod
-    );
+function os_payment_redact(
+    mixed $value
+): string {
+    return '[REDACTED]';
 }
 
 /**
- * Indicates whether a request is considered state-changing.
+ * Explicitly disables the old plaintext-cookie mechanism.
+ *
+ * The old implementation allowed the client to supply the payment amount.
+ * That trust model is intentionally removed.
+ *
+ * @return int
  */
-function os_payment_is_state_changing_request(): bool
+function os_payment_get_legacy_cookie(): int
 {
-    $method = strtoupper(
-        (string) ($_SERVER['REQUEST_METHOD'] ?? '')
-    );
-
-    return in_array(
-        $method,
-        [
-            'POST',
-            'PUT',
-            'PATCH',
-            'DELETE',
-        ],
-        true
-    );
-}
-
-/* ==========================================================================
- * SECURE AUTHENTICATION HELPER
- * ========================================================================== */
-
-/**
- * Performs the local password verification step.
- *
- * The caller MUST:
- * - retrieve the user record server-side;
- * - apply distributed rate limiting BEFORE expensive verification;
- * - use a generic failure response;
- * - regenerate the session after success;
- * - invalidate previous sessions where policy requires it.
- */
-function os_payment_verify_credentials(
-    string $password,
-    string $storedHash
-): bool {
-    /*
-     * Always impose an upper bound before password_verify() to reduce
-     * resource-exhaustion risk.
-     */
-    if (
-        $password === ''
-        || strlen($password)
-            > OS_PAYMENT_PASSWORD_MAX_BYTES
-        || $storedHash === ''
-        || strlen($storedHash) > 1024
-    ) {
-        return false;
-    }
-
-    /*
-     * password_verify() is the correct API. Never use:
-     *
-     * $password === $storedHash
-     * md5()
-     * sha1()
-     * hash('sha256', $password)
-     *
-     * for password storage.
-     */
-    return os_payment_password_verify(
-        $password,
-        $storedHash
-    );
-}
-
-/* ==========================================================================
- * SENSITIVE OPERATION REAUTHENTICATION
- * ========================================================================== */
-
-/**
- * Requires a recent successful authentication.
- *
- * Sensitive operations should require reauthentication even when an active
- * session exists.
- */
-function os_payment_require_recent_auth(
-    int $maxAgeSeconds = 900
-): bool {
-    if (
-        $maxAgeSeconds < 1
-        || session_status()
-            !== PHP_SESSION_ACTIVE
-    ) {
-        return false;
-    }
-
-    if (
-        !isset($_SESSION['authenticated_at'])
-        || !is_int($_SESSION['authenticated_at'])
-    ) {
-        return false;
-    }
-
-    return time()
-        - $_SESSION['authenticated_at']
-        <= $maxAgeSeconds;
-}
-
-/* ==========================================================================
- * FAIL-CLOSED UTILITIES
- * ========================================================================== */
-
-/**
- * Generic security failure.
- *
- * Never expose cryptographic, database or authentication internals to the
- * client.
- */
-function os_payment_fail_closed(): never
-{
-    http_response_code(403);
-    exit;
+    return 0;
 }
