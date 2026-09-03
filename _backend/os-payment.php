@@ -1,69 +1,73 @@
 <?php
 
 require_once __DIR__ . '/bootstrap.php';
-
 require_once __DIR__ . '/log-echo.php';
 
 /**
- * os_payment_encode
- * Encodes text to be used in cookie storage
+ * Encodes text for use in cookie names.
  *
- * @param {String} $text - String to encode for use in cookie
- *
- * @return {String} - Text to use in cookie
+ * @param string $text Text to encode.
+ * @return string Encoded text.
  */
-function os_payment_encode(string $text)
+function os_payment_encode(string $text): string
 {
     return urlencode(str_replace([' ', '.'], '_', $text));
 }
 
 /**
- * os_payment_setcookie
- * Sets the payment cookie for a given release version
+ * Sets the payment cookie for a release version.
  *
- * @param {String} $version - Version of release to set cookie for
- * @param {Number} $amount - Amount paid for release
- *
- * @return {Boolean} - True if cookie was set
+ * @param string $version Release version.
+ * @param int $amount Amount paid for the release.
+ * @return bool True if the cookie was successfully set.
  */
-function os_payment_setcookie(string $version, int $amount)
+function os_payment_setcookie(string $version, int $amount): bool
 {
-    $string = os_payment_encode('os_payment_' . $version);
-    $expires = time() + 60 * 60 * 24 * 365; // One year in the future
+    $cookieName = os_payment_encode("os_payment_{$version}");
+    $expires = time() + (365 * 24 * 60 * 60);
 
-    return setcookie($string, $amount, $expires, '/', '', false, true);
+    return setcookie(
+        $cookieName,
+        (string) $amount,
+        $expires,
+        '/',
+        '',
+        false,
+        true
+    );
 }
 
 /**
- * os_payment_getcookie
- * Returns the amount paid for a release version
+ * Returns the amount paid for a release version.
  *
- * @param {String} $version - Version of release to get cookie for
- *
- * @return {Number} - Amount paid for release, 0 for not paid
+ * @param string $version Release version.
+ * @return int Amount paid, or 0 if no payment cookie exists.
  */
-function os_payment_getcookie(string $version)
+function os_payment_getcookie(string $version): int
 {
-    // DEPRECATED: this is the old version of cookie naming
-    if (!isset($version) || $version === '') {
-        $string = os_payment_encode('has_paid_' . $config['release_title'] . '_' . $config['release_version']);
+    if ($version === '') {
+        $legacyCookieName = os_payment_encode(
+            'has_paid_' . $config['release_title'] . '_' . $config['release_version']
+        );
 
-        if (isset($_COOKIE[$string])) {
-            return intval($_COOKIE[$string]);
+        if (isset($_COOKIE[$legacyCookieName])) {
+            return (int) $_COOKIE[$legacyCookieName];
         }
     }
 
-    // DEPRECATED: all deprecated variables can be removed next version release
-    $string = os_payment_encode('os_payment_' . $version);
-    $deprecated_string = os_payment_encode('has_paid_Loki_' . $version);
+    $cookieName = os_payment_encode("os_payment_{$version}");
+    $deprecatedCookieName = os_payment_encode("has_paid_Loki_{$version}");
 
-    if (isset($_COOKIE[$string])) {
-        return intval($_COOKIE[$string]);
+    if (isset($_COOKIE[$cookieName])) {
+        return (int) $_COOKIE[$cookieName];
     }
 
-    if (isset($_COOKIE[$deprecated_string])) {
-        return intval($_COOKIE[$deprecated_string]);
+    if (isset($_COOKIE[$deprecatedCookieName])) {
+        return (int) $_COOKIE[$deprecatedCookieName];
     }
 
     return 0;
 }
+?>
+
+
