@@ -1,21 +1,40 @@
 <?php
 
-if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-    $ip = $_SERVER['HTTP_CF_CONNECTING_IP'];
-} elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-    $ip = $_SERVER['HTTP_X_FORWARDED_FOR'];
-} elseif (!empty($_SERVER['HTTP_CLIENT_IP'])) {
-    $ip = $_SERVER['HTTP_CLIENT_IP'];
-} elseif (!empty($_SERVER['REMOTE_ADDR'])) {
-    $ip = $_SERVER['REMOTE_ADDR'];
-} else {
-    $ip = false;
+declare(strict_types=1);
+
+function getClientIp(): string|false
+{
+    $candidates = [
+        $_SERVER['HTTP_CF_CONNECTING_IP'] ?? null,
+        $_SERVER['REMOTE_ADDR'] ?? null,
+    ];
+
+    foreach ($candidates as $candidate) {
+        if (
+            is_string($candidate) &&
+            filter_var($candidate, FILTER_VALIDATE_IP) !== false
+        ) {
+            return $candidate;
+        }
+    }
+
+    return false;
 }
 
-// DEVELOPER OVERRIDE
-// Override IP here
-if ($ip == '127.0.0.1' ||
-    isset($_GET['ip_override'])
+$ip = getClientIp();
+
+/*
+ * Developer override.
+ *
+ * Configure DEV_IP_OVERRIDE as an environment variable instead
+ * of hardcoding an IP address in the source code.
+ */
+$overrideIp = getenv('DEV_IP_OVERRIDE');
+
+if (
+    ($ip === '127.0.0.1' || isset($_GET['ip_override'])) &&
+    is_string($overrideIp) &&
+    filter_var($overrideIp, FILTER_VALIDATE_IP) !== false
 ) {
-    $ip = '78.148.208.61';
+    $ip = $overrideIp;
 }
