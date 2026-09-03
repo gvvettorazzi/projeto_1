@@ -5,16 +5,16 @@ require_once __DIR__ . '/log-echo.php';
 
 use GeoIp2\Database\Reader;
 
-/**
- * Path to the GeoIP database.
- */
 const GEOIP_DATABASE_PATH = __DIR__ . '/GeoLite2-City.mmdb';
+
+const DEFAULT_DOWNLOAD_REGIONS = ['nyc3', 'ams3'];
+const NORTH_AMERICA_REGIONS = ['nyc3', 'sfo1'];
+const EUROPE_REGIONS = ['ams3', 'fra1'];
 
 /**
  * Returns a shared GeoIP reader instance.
  *
- * Reusing the reader avoids reopening the GeoIP database
- * multiple times during the same request.
+ * @return Reader
  *
  * @throws RuntimeException
  */
@@ -30,10 +30,8 @@ function getGeoIpReader()
         throw new RuntimeException('Class GeoIp2\Database\Reader not found');
     }
 
-    if (!is_readable(GEOIP_DATABASE_PATH)) {
-        throw new RuntimeException(
-            'GeoIP database not found or not readable: ' . GEOIP_DATABASE_PATH
-        );
+    if (!is_file(GEOIP_DATABASE_PATH) || !is_readable(GEOIP_DATABASE_PATH)) {
+        throw new RuntimeException('GeoIP database is unavailable');
     }
 
     $reader = new Reader(GEOIP_DATABASE_PATH);
@@ -42,38 +40,119 @@ function getGeoIpReader()
 }
 
 /**
- * Handles GeoIP errors consistently.
+ * Normalizes and validates an IP address.
  *
- * @param Throwable $exception
- * @param bool      $debug
+ * Supports both IPv4 and IPv6.
+ *
+ * @param mixed $hostname
+ *
+ * @return string|null
  */
-function handleGeoIpError($exception, $debug = false)
+function normalizeIpAddress($hostname)
 {
-    $message = $exception->getMessage();
+    if (!is_string($hostname) && !is_numeric($hostname)) {
+        return null;
+    }
 
-    if ($debug) {
+    $hostname = trim((string) $hostname);
+
+    if ($hostname === '' || strlen($hostname) > 45) {
+        return null;
+    }
+
+    $validatedIp = filter_var($hostname, FILTER_VALIDATE_IP);
+
+    return $validatedIp !== false ? $validatedIp : null;
+}
+
+/**
+ * Sanitizes a generic input value while preserving compatibility
+ * with existing string-based operations.
+ *
+ * @param mixed $value
+ *
+ * @return string
+ */
+function sanitizeStringInput($value)
+{
+    if (!is_scalar($value)) {
+        return '';
+    }
+
+    $value = trim((string) $value);
+
+    return substr($value, 0, 255);
+}
+
+/**
+ * Safely outputs debug information.
+ *
+ * @param string $message
+ *
+ * @return void
+ */
+function outputDebug($message)
+{
+    $message = (string) $message;
+
+    if (PHP_SAPI === 'cli') {
         echo $message . PHP_EOL;
 
         return;
     }
 
-    error_log($message);
+    echo htmlspecialchars(
+        $message,
+        ENT_QUOTES | ENT_SUBSTITUTE,
+        'UTF-8'
+    ) . PHP_EOL;
+}
+
+/**
+ * Handles GeoIP errors consistently.
+ *
+ * @param Throwable $exception
+ * @param bool      $debug
+ *
+ * @return void
+ */
+function handleGeoIpError($exception, $debug = false)
+{
+    $message = $exception instanceof Throwable
+        ? $exception->getMessage()
+        : 'Unknown GeoIP error';
+
+    if ((bool) $debug) {
+        outputDebug($message);
+
+        return;
+    }
+
+    error_log('GeoIP error: ' . $message);
 }
 
 /**
  * Looks up an IP address using the GeoIP database.
  *
- * Returns null when the lookup cannot be completed.
- *
- * @param string $hostname
- * @param bool   $debug
+ * @param mixed $hostname
+ * @param bool  $debug
  *
  * @return mixed|null
  */
 function getGeoIpRecord($hostname, $debug = false)
 {
+    $ipAddress = normalizeIpAddress($hostname);
+
+    if ($ipAddress === null) {
+        if ((bool) $debug) {
+            outputDebug('Invalid IP address');
+        }
+
+        return null;
+    }
+
     try {
-        return getGeoIpReader()->city($hostname);
+        return getGeoIpReader()->city($ipAddress);
     } catch (Throwable $exception) {
         handleGeoIpError($exception, $debug);
 
@@ -84,11 +163,8 @@ function getGeoIpRecord($hostname, $debug = false)
 /**
  * Determines the preferred download region for an IP address.
  *
- * A string means that a single region should be used.
- * An array means that traffic may be balanced between two regions.
- *
- * @param string $hostname
- * @param bool   $debug
+ * @param mixed $hostname
+ * @param bool  $debug
  *
  * @return string|array
  */
@@ -96,14 +172,27 @@ function getDownloadRegion($hostname, $debug = false)
 {
     $record = getGeoIpRecord($hostname, $debug);
 
-    $continent = $record ? $record->continent->code : null;
-    $country = $record ? $record->country->isoCode : null;
-    $longitude = $record ? $record->location->longitude : null;
+    if ($record === null) {
+        return DEFAULT_DOWNLOAD_REGIONS;
+    }
 
-    if ($debug) {
-        echo 'Continent: "' . ($continent ?? '') . '"' . PHP_EOL;
-        echo 'Country: "' . ($country ?? '') . '"' . PHP_EOL;
-        echo 'Longitude: "' . ($longitude ?? '') . '"' . PHP_EOL;
+    $continent = isset($record->continent->code)
+        ? (string) $record->continent->code
+        : null;
+
+    $country = isset($record->country->isoCode)
+        ? (string) $record->country->isoCode
+        : null;
+
+    $longitude = isset($record->location->longitude)
+        && is_numeric($record->location->longitude)
+        ? (float) $record->location->longitude
+        : null;
+
+    if ((bool) $debug) {
+        outputDebug('Continent: "' . ($continent ?? '') . '"');
+        outputDebug('Country: "' . ($country ?? '') . '"');
+        outputDebug('Longitude: "' . ($longitude ?? '') . '"');
     }
 
     switch ($continent) {
@@ -114,10 +203,10 @@ function getDownloadRegion($hostname, $debug = false)
             return getEuropeRegion($country);
 
         case 'SA':
-            return ['nyc3', 'sfo1'];
+            return NORTH_AMERICA_REGIONS;
 
         case 'AF':
-            return ['fra1', 'ams3'];
+            return EUROPE_REGIONS;
 
         case 'AS':
         case 'OC':
@@ -125,14 +214,12 @@ function getDownloadRegion($hostname, $debug = false)
             return 'sgp1';
 
         default:
-            // Graceful fallback when GeoIP is unavailable
-            // or the continent cannot be determined.
-            return ['nyc3', 'ams3'];
+            return DEFAULT_DOWNLOAD_REGIONS;
     }
 }
 
 /**
- * Determines the download region for North America.
+ * Determines the preferred download region for North America.
  *
  * @param string|null $country
  * @param float|null  $longitude
@@ -186,25 +273,27 @@ function getNorthAmericaRegion($country, $longitude)
         'VI',
     ];
 
+    $country = normalizeCountryCode($country);
+
     if (
-        in_array($country, $westCoastCountries, true) ||
-        ($longitude !== null && $longitude < -100)
+        in_array($country, $westCoastCountries, true)
+        || ($longitude !== null && $longitude < -100)
     ) {
         return 'sfo1';
     }
 
     if (
-        in_array($country, $eastCoastCountries, true) ||
-        ($longitude !== null && $longitude >= -100)
+        in_array($country, $eastCoastCountries, true)
+        || ($longitude !== null && $longitude >= -100)
     ) {
         return 'nyc3';
     }
 
-    return ['nyc3', 'sfo1'];
+    return NORTH_AMERICA_REGIONS;
 }
 
 /**
- * Determines the download region for Europe.
+ * Determines the preferred download region for Europe.
  *
  * @param string|null $country
  *
@@ -213,7 +302,6 @@ function getNorthAmericaRegion($country, $longitude)
 function getEuropeRegion($country)
 {
     static $amsCountries = [
-        // British Isles / North Atlantic
         'GB',
         'IM',
         'IE',
@@ -222,8 +310,6 @@ function getEuropeRegion($country)
         'GG',
         'JE',
         'GI',
-
-        // Northern Europe
         'NL',
         'SX',
         'DK',
@@ -233,36 +319,62 @@ function getEuropeRegion($country)
         'SJ',
     ];
 
+    $country = normalizeCountryCode($country);
+
     if (in_array($country, $amsCountries, true)) {
         return 'ams3';
     }
 
-    return ['ams3', 'fra1'];
+    return EUROPE_REGIONS;
 }
 
 /**
- * Generates a deterministic value (0 or 1) from an IP address.
+ * Normalizes an ISO country code.
  *
- * Used when balancing traffic between the two regions returned
- * by getDownloadRegion().
+ * @param mixed $country
  *
- * @param string $hostname
- * @param bool   $debug
+ * @return string|null
+ */
+function normalizeCountryCode($country)
+{
+    if (!is_string($country)) {
+        return null;
+    }
+
+    $country = strtoupper(trim($country));
+
+    if (!preg_match('/^[A-Z]{2}$/', $country)) {
+        return null;
+    }
+
+    return $country;
+}
+
+/**
+ * Generates a deterministic value (0 or 1) from an address.
+ *
+ * The original hashing behavior is intentionally preserved
+ * for compatibility with the existing traffic distribution.
+ *
+ * @param mixed $hostname
+ * @param bool  $debug
  *
  * @return int
  */
 function getIPHash($hostname, $debug = false)
 {
+    $hostname = sanitizeStringInput($hostname);
+
     $hash = array_sum(str_split($hostname));
 
-    if ($debug) {
-        echo 'Hash: "' . $hash . '"' . PHP_EOL;
+    if ((bool) $debug) {
+        outputDebug('Hash: "' . $hash . '"');
     }
 
     $remainder = $hash % 10;
 
-    if ($debug) {
-        echo 'Remainder: "' . $remainder . '"' . PHP_EOL;
+    if ((bool) $debug) {
+        outputDebug('Remainder: "' . $remainder . '"');
     }
 
     return $remainder > 5 ? 0 : 1;
@@ -271,35 +383,66 @@ function getIPHash($hostname, $debug = false)
 /**
  * Returns geographical information for an IP address.
  *
- * All fields are returned as false when the GeoIP lookup fails,
- * maintaining compatibility with the previous implementation.
- *
- * @param string $hostname
- * @param bool   $debug
+ * @param mixed $hostname
+ * @param bool  $debug
  *
  * @return array
  */
 function getCurrentLocation($hostname, $debug = false)
 {
-    if ($debug) {
-        echo $hostname . PHP_EOL;
+    $ipAddress = normalizeIpAddress($hostname);
+
+    if ((bool) $debug) {
+        outputDebug($ipAddress ?? 'Invalid IP address');
     }
 
-    $record = getGeoIpRecord($hostname, $debug);
+    if ($ipAddress === null) {
+        return emptyLocation();
+    }
+
+    $record = getGeoIpRecord($ipAddress, $debug);
 
     if ($record === null) {
         return emptyLocation();
     }
 
     return [
-        'city' => $record->city->name,
-        'state' => $record->mostSpecificSubdivision->name,
-        'stateCode' => $record->mostSpecificSubdivision->isoCode,
-        'country' => $record->country->name,
-        'countryCode' => $record->country->isoCode,
-        'postcode' => $record->postal->code,
-        'continent' => $record->continent->code,
+        'city' => getGeoIpValue($record->city->name ?? null),
+        'state' => getGeoIpValue(
+            $record->mostSpecificSubdivision->name ?? null
+        ),
+        'stateCode' => getGeoIpValue(
+            $record->mostSpecificSubdivision->isoCode ?? null
+        ),
+        'country' => getGeoIpValue($record->country->name ?? null),
+        'countryCode' => getGeoIpValue(
+            $record->country->isoCode ?? null
+        ),
+        'postcode' => getGeoIpValue($record->postal->code ?? null),
+        'continent' => getGeoIpValue(
+            $record->continent->code ?? null
+        ),
     ];
+}
+
+/**
+ * Normalizes a value returned by the GeoIP database.
+ *
+ * @param mixed $value
+ *
+ * @return string|false
+ */
+function getGeoIpValue($value)
+{
+    if ($value === null || $value === '') {
+        return false;
+    }
+
+    if (!is_scalar($value)) {
+        return false;
+    }
+
+    return trim((string) $value);
 }
 
 /**
